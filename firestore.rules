@@ -1,0 +1,237 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- quem é o usuário ----------
+    function logado() { return request.auth != null; }
+    function caminhoEu() { return /databases/$(db)/documents/usuarios/$(request.auth.uid); }
+    function eu() { return get(caminhoEu()).data; }
+    function ativo() { return logado() && exists(caminhoEu()) && eu().ativo == true; }
+    function setupFeito() { return exists(/databases/$(db)/documents/config/setup); }
+
+    // ---------- funções e permissões (iguais à variável PERFIL do index.html) ----------
+    function obrig(c) {
+      return c == 'encarregado' ? ['pedido.criar', 'pedido.ver_frente', 'pedido.confirmar_recebimento']
+        : c == 'estoque' ? ['pedido.ver_todos', 'estoque.atender']
+        : c == 'compras' ? ['pedido.ver_todos', 'compras.gerenciar']
+        : c == 'financeiro' ? ['financeiro.ver_compras']
+        : c == 'admin' ? ['pedido.ver_todos', 'painel.fluxo', 'relatorios.exportar', 'admin.usuarios', 'admin.config', 'admin.backup', 'admin.auditoria', 'admin.pedidos', 'financeiro.ver_compras']
+        : [];
+    }
+    function opcionais(c) {
+      return c == 'encarregado' ? ['pedido.excluir', 'painel.fluxo']
+        : c == 'estoque' ? ['painel.fluxo', 'relatorios.exportar']
+        : c == 'compras' ? ['compras.marcar_chegada', 'painel.fluxo', 'relatorios.exportar']
+        : c == 'financeiro' ? ['relatorios.exportar']
+        : [];
+    }
+    function padrao(c) {
+      return obrig(c).concat(c == 'encarregado' ? ['pedido.excluir']
+        : c == 'compras' ? ['compras.marcar_chegada', 'painel.fluxo']
+        : c == 'financeiro' ? ['relatorios.exportar'] : []);
+    }
+    function perms() { let u = eu(); return ('permissoes' in u) ? u.permissoes : padrao(u.cargo); }
+    // as obrigatórias da função valem sempre; 'pedido.cancelar' é o nome antigo de 'pedido.excluir'
+    function pode(p) {
+      return ativo() && (perms().hasAny([p]) || obrig(eu().cargo).hasAny([p])
+        || (p == 'pedido.excluir' && perms().hasAny(['pedido.cancelar'])));
+    }
+
+    function cadastroValido(d) {
+      return d.cargo in ['encarregado', 'estoque', 'compras', 'financeiro', 'admin']
+        && d.nome is string && d.nome.size() >= 3 && d.nome.size() <= 80
+        && d.frente is string && d.frente.size() >= 2 && d.frente.size() <= 80
+        && d.login is string && d.permissoes is list
+        && d.permissoes.hasAll(obrig(d.cargo))
+        && d.permissoes.hasOnly(obrig(d.cargo).concat(opcionais(d.cargo)));
+    }
+
+    // ---------- pessoas cadastradas aguardando o primeiro acesso ----------
+    // A tela de entrada lê os nomes para reconhecer quem está entrando (não há senha aqui).
+    match /convites/{cid} {
+      allow read: if true;
+      allow create: if pode('admin.usuarios') && cadastroValido(request.resource.data) && request.resource.data.usado == false;
+      allow update: if (pode('admin.usuarios') && resource.data.usado == false && cadastroValido(request.resource.data))
+        || (logado() && resource.data.usado == false
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usado', 'usadoPor', 'usadoEm'])
+            && request.resource.data.usado == true && request.resource.data.usadoPor == request.auth.uid
+            && getAfter(caminhoEu()).data.convite == cid);
+      allow delete: if pode('admin.usuarios') && resource.data.usado == false;
+    }
+
+    // ---------- usuários ----------
+    function veioDoConvite(d) {
+      let c = get(/databases/$(db)/documents/convites/$(d.convite)).data;
+      return c.usado == false && d.nome == c.nome && d.cargo == c.cargo && d.frente == c.frente
+        && d.permissoes == c.permissoes && d.login == c.login && d.ativo == true
+        && request.auth.token.email == c.login + '@pedidos-biazi.app';
+    }
+    match /usuarios/{uid} {
+      allow read: if true;
+      allow create: if (logado() && request.auth.uid == uid && ('convite' in request.resource.data) && veioDoConvite(request.resource.data))
+        || (logado() && request.auth.uid == uid && !setupFeito()
+            && existsAfter(/databases/$(db)/documents/config/setup)
+            && request.resource.data.cargo == 'admin' && cadastroValido(request.resource.data));
+      // cada pessoa pode mudar só o próprio nome
+      allow update: if (ativo() && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nome'])
+          && request.resource.data.nome is string
+          && request.resource.data.nome.size() >= 3 && request.resource.data.nome.size() <= 80)
+        || (pode('admin.usuarios') && cadastroValido(request.resource.data)
+            && request.resource.data.login == resource.data.login
+            && (request.auth.uid != uid || !('permissoes' in resource.data)
+                || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['cargo', 'ativo', 'permissoes'])));
+      allow delete: if false;
+    }
+
+    match /config/setup {
+      allow read: if true;
+      allow create: if logado() && !setupFeito();
+      allow update, delete: if false;
+    }
+    match /config/geral {
+      allow read: if ativo();
+      allow write: if pode('admin.config') && request.resource.data.operacoes is list;
+    }
+    match /config/contador {
+      allow read: if ativo();
+      allow create: if pode('pedido.criar') && request.resource.data.n == 1;
+      allow update: if pode('pedido.criar') && request.resource.data.n == resource.data.n + 1;
+      allow delete: if false;
+    }
+
+    // ---------- pedidos ----------
+    // compra com entrega direta na frente (sem passar pelo estoque)
+    function direto(e) { return ('info' in e) && ('entrega' in e.info) && e.info.entrega == 'direto'; }
+    function transicao(de, para, ped, ant) {
+      return (pode('estoque.atender') && ((de == 'aguardando' && para in ['separado', 'compra', 'devolvido'])
+                || (de in ['separado', 'nasede'] && para == 'enviado')
+                || (de == 'comprado' && para == 'nasede' && !direto(ant))))
+        || (pode('compras.gerenciar') && ((de == 'compra' && para in ['cotacao', 'comprado', 'devolvido'])
+                || (de == 'cotacao' && para in ['comprado', 'devolvido'])
+                || (de == 'comprado' && para == 'enviado' && direto(ant))))
+        || (pode('compras.marcar_chegada') && de == 'comprado' && para == 'nasede' && !direto(ant))
+        || (pode('pedido.confirmar_recebimento') && ped.frente == eu().frente
+            && ((de == 'enviado' && para == 'recebido') || (de == 'comprado' && para == 'recebido' && direto(ant))))
+        // quem fez o pedido: corrige e reenvia o item devolvido, ou cancela
+        || (pode('pedido.criar') && ped.criadoPor == request.auth.uid
+            && ((de == 'devolvido' && para in ['aguardando', 'cancelado']) || (de == 'aguardando' && para == 'cancelado')));
+    }
+    // "Compra feita" só passa com o local da compra e o valor pago
+    function compraCompleta(n) {
+      return n.st != 'comprado' || (('info' in n) && ('fornecedor' in n.info) && ('valor' in n.info)
+        && n.info.fornecedor is string && n.info.fornecedor.size() >= 2
+        && n.info.valor is number && n.info.valor > 0);
+    }
+    function itemOk(i) {
+      let v = resource.data.estado;
+      let n = request.resource.data.estado;
+      return i >= v.size() || n[i].st == v[i].st || (transicao(v[i].st, n[i].st, resource.data, v[i]) && compraCompleta(n[i]));
+    }
+    function todosItensOk() {
+      return itemOk(0) && itemOk(1) && itemOk(2) && itemOk(3) && itemOk(4)
+        && itemOk(5) && itemOk(6) && itemOk(7) && itemOk(8) && itemOk(9)
+        && itemOk(10) && itemOk(11) && itemOk(12) && itemOk(13) && itemOk(14)
+        && itemOk(15) && itemOk(16) && itemOk(17) && itemOk(18) && itemOk(19)
+        && itemOk(20) && itemOk(21) && itemOk(22) && itemOk(23) && itemOk(24);
+    }
+    // pedido "direto para Compras" nasce em 'compra'; enquanto ninguém mexeu, ainda pode ser excluído
+    function inicial() { return ('destino' in resource.data) && resource.data.destino == 'compras' ? 'compra' : 'aguardando'; }
+    function aguardando(i) { return i >= resource.data.estado.size() || resource.data.estado[i].st == inicial(); }
+    function nadaRespondido() {
+      return aguardando(0) && aguardando(1) && aguardando(2) && aguardando(3) && aguardando(4)
+        && aguardando(5) && aguardando(6) && aguardando(7) && aguardando(8) && aguardando(9)
+        && aguardando(10) && aguardando(11) && aguardando(12) && aguardando(13) && aguardando(14)
+        && aguardando(15) && aguardando(16) && aguardando(17) && aguardando(18) && aguardando(19)
+        && aguardando(20) && aguardando(21) && aguardando(22) && aguardando(23) && aguardando(24);
+    }
+    function historicoCresceUm() {
+      return request.resource.data.historico.size() == resource.data.historico.size() + 1
+        && request.resource.data.historico[0:resource.data.historico.size()] == resource.data.historico
+        && request.resource.data.historico[resource.data.historico.size()].por == request.auth.uid;
+    }
+
+    match /pedidos/{id} {
+      allow read: if pode('pedido.ver_todos')
+        || (pode('pedido.ver_frente') && resource.data.frente == eu().frente)
+        || (pode('financeiro.ver_compras') && resource.data.teveCompra == true);
+
+      allow create: if pode('pedido.criar')
+        && request.resource.data.criadoPor == request.auth.uid
+        && request.resource.data.frente == eu().frente
+        && request.resource.data.tipoOperacao is string && request.resource.data.tipoOperacao.size() >= 2
+        && request.resource.data.itens.size() > 0 && request.resource.data.itens.size() <= 15
+        && request.resource.data.estado.size() == request.resource.data.itens.size()
+        && request.resource.data.historico.size() == 1
+        && request.resource.data.historico[0].por == request.auth.uid;
+
+      // o conteúdo do pedido é travado; só a situação anda, e só nas transições permitidas
+      allow update: if ativo()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado', 'historico', 'status', 'atualizadoEm', 'teveCompra'])
+        && request.resource.data.estado.size() == resource.data.estado.size()
+        && historicoCresceUm()
+        && todosItensOk();
+
+      // estoque tinha só uma parte: o item é dividido e o restante entra como item novo (vai para compra)
+      allow update: if pode('estoque.atender')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['itens', 'estado', 'historico', 'status', 'atualizadoEm', 'teveCompra'])
+        && request.resource.data.itens.size() == resource.data.itens.size() + 1
+        && request.resource.data.itens.size() <= 25
+        && request.resource.data.estado.size() == request.resource.data.itens.size()
+        && request.resource.data.estado[request.resource.data.estado.size() - 1].st == 'compra'
+        && historicoCresceUm();
+
+      // item devolvido: quem fez o pedido corrige os dados do item e reenvia (ou cancela)
+      allow update: if pode('pedido.criar') && resource.data.criadoPor == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['itens', 'estado', 'historico', 'status', 'atualizadoEm'])
+        && request.resource.data.itens.size() == resource.data.itens.size()
+        && request.resource.data.estado.size() == resource.data.estado.size()
+        && historicoCresceUm()
+        && todosItensOk();
+
+      // correção do administrador: situação de qualquer item e dados de entrega, nunca o que foi pedido
+      allow update: if pode('admin.pedidos')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado', 'historico', 'status', 'atualizadoEm', 'localidade', 'situacao', 'maquinaParada', 'teveCompra'])
+        && request.resource.data.estado.size() == resource.data.estado.size()
+        && request.resource.data.situacao in ['normal', 'urgente']
+        && historicoCresceUm();
+
+      // exclusão: só quem abriu, com a permissão, antes de o estoque responder (a senha é conferida no app)
+      allow delete: if pode('pedido.excluir')
+        && resource.data.criadoPor == request.auth.uid
+        && nadaRespondido();
+    }
+
+    // vídeos: a ficha em 'midias' e o arquivo dividido em pedaços em 'midiapartes'
+    match /midias/{id} {
+      allow read: if ativo();
+      allow create: if ativo() && request.resource.data.por == request.auth.uid
+        && request.resource.data.partes is int && request.resource.data.partes <= 40;
+      allow update: if false;
+      allow delete: if ativo() && resource.data.por == request.auth.uid;
+    }
+    match /midiapartes/{id} {
+      allow read: if ativo();
+      allow create: if ativo() && request.resource.data.por == request.auth.uid && request.resource.data.data.size() <= 750000;
+      allow update: if false;
+      allow delete: if ativo() && resource.data.por == request.auth.uid;
+    }
+
+    match /fotos/{id} {
+      allow read: if ativo();
+      allow create: if ativo() && request.resource.data.por == request.auth.uid;
+      allow update: if false;
+      allow delete: if ativo() && resource.data.por == request.auth.uid;
+    }
+
+    // ---------- auditoria (só cresce) ----------
+    match /auditoria/{id} {
+      allow read: if pode('admin.auditoria');
+      allow create: if (ativo() && request.resource.data.por == request.auth.uid && request.resource.data.em is number)
+        || (!logado() && request.resource.data.acao == 'login_falhou'
+            && request.resource.data.keys().hasOnly(['em', 'por', 'porNome', 'cargo', 'acao', 'alvo', 'alvoNome', 'detalhes'])
+            && request.resource.data.detalhes.size() < 200);
+      allow update, delete: if false;
+    }
+  }
+}

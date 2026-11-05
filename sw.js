@@ -1,6 +1,6 @@
 /* Service worker simples: guarda a casca do app para abrir rápido e sem sinal.
    Os dados (pedidos) vêm sempre do Firebase. */
-var CACHE = "pedidos-fazenda-v10";
+var CACHE = "pedidos-fazenda-v11";
 var CASCA = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 self.addEventListener("install", function (e) { e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(CASCA); })); self.skipWaiting(); });
 self.addEventListener("activate", function (e) {

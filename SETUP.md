@@ -150,15 +150,18 @@ service cloud.firestore {
     // compra com entrega direta na frente (sem passar pelo estoque)
     function direto(e) { return ('info' in e) && ('entrega' in e.info) && e.info.entrega == 'direto'; }
     function transicao(de, para, ped, ant) {
-      return (pode('estoque.atender') && ((de == 'aguardando' && para in ['separado', 'compra'])
+      return (pode('estoque.atender') && ((de == 'aguardando' && para in ['separado', 'compra', 'devolvido'])
                 || (de in ['separado', 'nasede'] && para == 'enviado')
                 || (de == 'comprado' && para == 'nasede' && !direto(ant))))
-        || (pode('compras.gerenciar') && ((de == 'compra' && para in ['cotacao', 'comprado'])
-                || (de == 'cotacao' && para == 'comprado')
+        || (pode('compras.gerenciar') && ((de == 'compra' && para in ['cotacao', 'comprado', 'devolvido'])
+                || (de == 'cotacao' && para in ['comprado', 'devolvido'])
                 || (de == 'comprado' && para == 'enviado' && direto(ant))))
         || (pode('compras.marcar_chegada') && de == 'comprado' && para == 'nasede' && !direto(ant))
         || (pode('pedido.confirmar_recebimento') && ped.frente == eu().frente
-            && ((de == 'enviado' && para == 'recebido') || (de == 'comprado' && para == 'recebido' && direto(ant))));
+            && ((de == 'enviado' && para == 'recebido') || (de == 'comprado' && para == 'recebido' && direto(ant))))
+        // quem fez o pedido: corrige e reenvia o item devolvido, ou cancela
+        || (pode('pedido.criar') && ped.criadoPor == request.auth.uid
+            && ((de == 'devolvido' && para in ['aguardando', 'cancelado']) || (de == 'aguardando' && para == 'cancelado')));
     }
     // "Compra feita" só passa com o local da compra e o valor pago
     function compraCompleta(n) {
@@ -174,7 +177,9 @@ service cloud.firestore {
     function todosItensOk() {
       return itemOk(0) && itemOk(1) && itemOk(2) && itemOk(3) && itemOk(4)
         && itemOk(5) && itemOk(6) && itemOk(7) && itemOk(8) && itemOk(9)
-        && itemOk(10) && itemOk(11) && itemOk(12) && itemOk(13) && itemOk(14);
+        && itemOk(10) && itemOk(11) && itemOk(12) && itemOk(13) && itemOk(14)
+        && itemOk(15) && itemOk(16) && itemOk(17) && itemOk(18) && itemOk(19)
+        && itemOk(20) && itemOk(21) && itemOk(22) && itemOk(23) && itemOk(24);
     }
     // pedido "direto para Compras" nasce em 'compra'; enquanto ninguém mexeu, ainda pode ser excluído
     function inicial() { return ('destino' in resource.data) && resource.data.destino == 'compras' ? 'compra' : 'aguardando'; }
@@ -182,7 +187,9 @@ service cloud.firestore {
     function nadaRespondido() {
       return aguardando(0) && aguardando(1) && aguardando(2) && aguardando(3) && aguardando(4)
         && aguardando(5) && aguardando(6) && aguardando(7) && aguardando(8) && aguardando(9)
-        && aguardando(10) && aguardando(11) && aguardando(12) && aguardando(13) && aguardando(14);
+        && aguardando(10) && aguardando(11) && aguardando(12) && aguardando(13) && aguardando(14)
+        && aguardando(15) && aguardando(16) && aguardando(17) && aguardando(18) && aguardando(19)
+        && aguardando(20) && aguardando(21) && aguardando(22) && aguardando(23) && aguardando(24);
     }
     function historicoCresceUm() {
       return request.resource.data.historico.size() == resource.data.historico.size() + 1
@@ -207,6 +214,23 @@ service cloud.firestore {
       // o conteúdo do pedido é travado; só a situação anda, e só nas transições permitidas
       allow update: if ativo()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado', 'historico', 'status', 'atualizadoEm', 'teveCompra'])
+        && request.resource.data.estado.size() == resource.data.estado.size()
+        && historicoCresceUm()
+        && todosItensOk();
+
+      // estoque tinha só uma parte: o item é dividido e o restante entra como item novo (vai para compra)
+      allow update: if pode('estoque.atender')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['itens', 'estado', 'historico', 'status', 'atualizadoEm', 'teveCompra'])
+        && request.resource.data.itens.size() == resource.data.itens.size() + 1
+        && request.resource.data.itens.size() <= 25
+        && request.resource.data.estado.size() == request.resource.data.itens.size()
+        && request.resource.data.estado[request.resource.data.estado.size() - 1].st == 'compra'
+        && historicoCresceUm();
+
+      // item devolvido: quem fez o pedido corrige os dados do item e reenvia (ou cancela)
+      allow update: if pode('pedido.criar') && resource.data.criadoPor == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['itens', 'estado', 'historico', 'status', 'atualizadoEm'])
+        && request.resource.data.itens.size() == resource.data.itens.size()
         && request.resource.data.estado.size() == resource.data.estado.size()
         && historicoCresceUm()
         && todosItensOk();
